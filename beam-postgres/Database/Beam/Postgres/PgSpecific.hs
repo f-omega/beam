@@ -823,7 +823,7 @@ class IsPgJSON (json :: * -> *) where
                    -> QGenExpr ctxt Postgres s (json b)
 
   -- | The @json_agg@ or @jsonb_agg@ aggregate.
-  pgJsonAgg :: QExpr Postgres s a -> QAgg Postgres s (json a)
+  pgJsonAgg :: QExpr Postgres s (json a) -> QAgg Postgres s (json (V.Vector a))
 
   -- | The @json_object_agg@ or @jsonb_object_agg@. The first argument gives the
   -- key source and the second the corresponding values.

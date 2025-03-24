@@ -66,6 +66,7 @@ import           Data.Hashable
 import           Data.Int
 import           Data.Maybe
 import           Data.Scientific
+import           Data.Semigroup (Any(..))
 import           Data.String
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -201,7 +202,9 @@ fromSqliteCommand (SqliteCommandInsert (SqliteInsertSyntax tbl fields values onC
     formatSqliteInsertOnConflict tbl fields values onConflict
 
 -- | SQLite @SELECT@ syntax
-newtype SqliteSelectSyntax = SqliteSelectSyntax { fromSqliteSelect :: SqliteSyntax }
+data SqliteSelectSyntax = SqliteSelectSyntax { sqliteSelectCTEs :: [SqliteCTE]
+                                             , sqliteSelectRecursive :: Bool
+                                             , sqliteBaseSelect :: SqliteSyntax }
 
 -- | SQLite @ON CONFLICT@ syntax
 newtype SqliteOnConflictSyntax = SqliteOnConflictSyntax { fromSqliteOnConflict :: SqliteSyntax }
@@ -223,7 +226,8 @@ newtype SqliteUpdateSyntax = SqliteUpdateSyntax { fromSqliteUpdate :: SqliteSynt
 -- | SQLite @DELETE@ syntax
 newtype SqliteDeleteSyntax = SqliteDeleteSyntax { fromSqliteDelete :: SqliteSyntax }
 
-data SqliteSelectTableSyntax = SqliteSelectTableSyntax { sqliteSelectCTEs :: [SqliteCTE]
+data SqliteSelectTableSyntax = SqliteSelectTableSyntax { sqliteSelectTblCTEs :: [SqliteCTE]
+                                                       , sqliteSelectTblRecursive :: Bool
                                                        , fromSqliteSelectTable :: SqliteSyntax }
 
 -- | Implements beam SQL expression syntaxes
@@ -232,7 +236,7 @@ data SqliteExpressionSyntax
   | SqliteExpressionDefault
   deriving (Show, Eq, Generic)
 instance Hashable SqliteExpressionSyntax
-data SqliteFromSyntax = SqliteFromSyntax { sqliteFromCTEs :: [SqliteCTE], fromSqliteFromSyntax :: SqliteSyntax }
+data SqliteFromSyntax = SqliteFromSyntax { sqliteFromCTEs :: [SqliteCTE], sqliteFromRecursive :: Bool, fromSqliteFromSyntax :: SqliteSyntax }
 newtype SqliteComparisonQuantifierSyntax = SqliteComparisonQuantifierSyntax { fromSqliteComparisonQuantifier :: SqliteSyntax }
 newtype SqliteAggregationSetQuantifierSyntax = SqliteAggregationSetQuantifierSyntax { fromSqliteAggregationSetQuantifier :: SqliteSyntax }
 newtype SqliteProjectionSyntax = SqliteProjectionSyntax { fromSqliteProjection :: SqliteSyntax }
@@ -242,10 +246,12 @@ newtype SqliteOrderingSyntax = SqliteOrderingSyntax { fromSqliteOrdering :: Sqli
 newtype SqliteValueSyntax = SqliteValueSyntax { fromSqliteValue :: SqliteSyntax }
 data SqliteTableSourceSyntax = SqliteTableSourceSyntax
     { sqliteTableSourceCTEs :: [SqliteCTE]
+    , sqliteTableSourceRecursive :: Bool
     , fromSqliteTableSource :: SqliteSyntax }
 newtype SqliteFieldNameSyntax = SqliteFieldNameSyntax { fromSqliteFieldNameSyntax :: SqliteSyntax }
 
 data SqliteCTE = SqliteCTE { sqliteCteColumnNames :: Maybe [T.Text]
+                           , sqliteCteName :: Maybe T.Text
                            , sqliteCteSelect :: SqliteSelectSyntax }
 
 -- | SQLite @VALUES@ clause in @INSERT@. Expressions need to be handled
@@ -339,7 +345,8 @@ formatSqliteInsertOnConflict tblNm fields values onConflict = mconcat
       else parens (commas (map quotedIdentifier fields))
   , emit " "
   , case values of
-      SqliteInsertFromSql (SqliteSelectSyntax select) -> select
+      SqliteInsertFromSql (SqliteSelectSyntax [] False select) -> select
+      SqliteInsertFromSql _ -> error "TODO: handle WITH... clauses in INSERT"
       -- Because SQLite doesn't support explicit DEFAULT values, if an insert
       -- batch contains any defaults, we split it into a series of single-row
       -- inserts specifying only the non-default columns (which could differ
@@ -360,7 +367,28 @@ instance IsSql92Syntax SqliteCommandSyntax where
   type Sql92UpdateSyntax SqliteCommandSyntax = SqliteUpdateSyntax
   type Sql92DeleteSyntax SqliteCommandSyntax = SqliteDeleteSyntax
 
-  selectCmd = SqliteCommandSyntax . fromSqliteSelect
+  selectCmd (SqliteSelectSyntax ctes recursive select) =
+      SqliteCommandSyntax (withClause <> select)
+    where
+      withClause = case ctes of
+                     [] -> mempty
+                     _  -> emit "WITH " <> (if recursive then emit "RECURSIVE " else mempty) <>
+                           go (0 :: Int) ctes <> emit " "
+
+      go _ [] = mempty
+      go n [cte] = let (n', s) = emitCte n cte
+                   in s <> emit " "
+      go n (cte:ctes) = let (n', s) = emitCte (n :: Int) cte
+                        in s <> emit ", " <> go n' ctes
+
+      emitCte n (SqliteCTE mColNames mName cte) =
+          let (n', nm) = case mName of
+                           Nothing -> (n + 1, emit "tbl_" <> emit' n)
+                           Just nm -> (n, quotedIdentifier nm)
+              colNames = case mColNames of
+                           Nothing -> mempty
+                           Just nms -> parens (commas (map quotedIdentifier nms))
+          in (n', nm <> colNames <> emit " AS " <> parens (sqliteBaseSelect cte))
   insertCmd = SqliteCommandInsert
   updateCmd = SqliteCommandSyntax . fromSqliteUpdate
   deleteCmd = SqliteCommandSyntax . fromSqliteDelete
@@ -631,8 +659,7 @@ instance IsSql92SelectSyntax SqliteSelectSyntax where
   type Sql92SelectOrderingSyntax SqliteSelectSyntax = SqliteOrderingSyntax
 
   selectStmt tbl ordering limit offset =
-    SqliteSelectSyntax $
-    withClause <>
+    SqliteSelectSyntax (sqliteSelectTblCTEs tbl) False $
     fromSqliteSelectTable tbl <>
     (case ordering of
        [] -> mempty
@@ -644,15 +671,32 @@ instance IsSql92SelectSyntax SqliteSelectSyntax where
       (Just limit, Just offset) -> emit " LIMIT " <> emit' limit <>
                                    emit " OFFSET " <> emit' offset
     where
-      withClause = case sqliteSelectCTEs tbl of
-                     [] -> mempty
-                     _  -> emit "WITH " <> commas (zipWith buildCte [0..] (sqliteSelectCTEs tbl))
-      buildCte :: Int -> SqliteCTE -> SqliteSyntax
-      buildCte n (SqliteCTE mColNames cte) = emit "tbl_" <> emit' n <> colNames <> emit " AS " <> parens (fromSqliteSelect cte)
-         where
-           colNames = case mColNames of
-                        Nothing -> mempty
-                        Just nms -> parens (commas (map quotedIdentifier nms))
+--      withClause = case sqliteSelectCTEs tbl of
+--                     [] -> mempty
+--                     _  -> emit "WITH " <> commas (zipWith buildCte [0..] (sqliteSelectCTEs tbl))
+--      buildCte :: Int -> SqliteCTE -> SqliteSyntax
+--      buildCte n (SqliteCTE mColNames cte) = emit "tbl_" <> emit' n <> colNames <> emit " AS " <> parens (fromSqliteSelect cte)
+--         where
+--           colNames = case mColNames of
+--                        Nothing -> mempty
+--                        Just nms -> parens (commas (map quotedIdentifier nms))
+
+instance IsSql99CommonTableExpressionSelectSyntax SqliteSelectSyntax where
+    type Sql99SelectCTESyntax SqliteSelectSyntax = SqliteCTE
+    withSyntax ctes select = select { sqliteSelectCTEs = sqliteSelectCTEs select ++ subs ++ ctes, sqliteSelectRecursive = recursive }
+      where subs = foldMap (sqliteSelectCTEs . sqliteCteSelect) ctes
+            recursive = getAny (foldMap (Any . sqliteSelectRecursive . sqliteCteSelect) ctes)
+
+instance IsSql99RecursiveCommonTableExpressionSelectSyntax SqliteSelectSyntax where
+    withRecursiveSyntax ctes select = (withSyntax ctes select) { sqliteSelectRecursive = True }
+
+instance IsSql99CommonTableExpressionSyntax SqliteCTE where
+    type Sql99CTESelectSyntax SqliteCTE = SqliteSelectSyntax
+
+    cteSubquerySyntax tbl fields select =
+        SqliteCTE { sqliteCteColumnNames = Just fields
+                  , sqliteCteName = Just tbl
+                  , sqliteCteSelect = select }
 
 instance IsSql92SelectTableSyntax SqliteSelectTableSyntax where
   type Sql92SelectTableSelectSyntax SqliteSelectTableSyntax = SqliteSelectSyntax
@@ -663,7 +707,7 @@ instance IsSql92SelectTableSyntax SqliteSelectTableSyntax where
   type Sql92SelectTableSetQuantifierSyntax SqliteSelectTableSyntax = SqliteAggregationSetQuantifierSyntax
 
   selectTableStmt setQuantifier proj from where_ grouping having =
-    SqliteSelectTableSyntax (fromMaybe [] (sqliteFromCTEs <$> from)) $
+    SqliteSelectTableSyntax (fromMaybe [] (sqliteFromCTEs <$> from)) (fromMaybe False (sqliteFromRecursive <$> from)) $
     emit "SELECT " <>
     maybe mempty (<> emit " ") (fromSqliteAggregationSetQuantifier <$> setQuantifier) <>
     fromSqliteProjection proj <>
@@ -678,16 +722,16 @@ instance IsSql92SelectTableSyntax SqliteSelectTableSyntax where
 
 tableOp :: ByteString -> SqliteSelectTableSyntax -> SqliteSelectTableSyntax -> SqliteSelectTableSyntax
 tableOp op a b =
-  SqliteSelectTableSyntax (sqliteSelectCTEs a <> sqliteSelectCTEs b) $
+  SqliteSelectTableSyntax (sqliteSelectTblCTEs a <> sqliteSelectTblCTEs b) (sqliteSelectTblRecursive a || sqliteSelectTblRecursive b) $
   fromSqliteSelectTable a <> spaces (emit op) <> fromSqliteSelectTable b
 
 instance IsSql92FromSyntax SqliteFromSyntax where
   type Sql92FromExpressionSyntax SqliteFromSyntax = SqliteExpressionSyntax
   type Sql92FromTableSourceSyntax SqliteFromSyntax = SqliteTableSourceSyntax
 
-  fromTable tableSrc Nothing = SqliteFromSyntax (sqliteTableSourceCTEs tableSrc) (fromSqliteTableSource tableSrc)
+  fromTable tableSrc Nothing = SqliteFromSyntax (sqliteTableSourceCTEs tableSrc) (sqliteTableSourceRecursive tableSrc) (fromSqliteTableSource tableSrc)
   fromTable tableSrc (Just (nm, Nothing)) =
-        SqliteFromSyntax (sqliteTableSourceCTEs tableSrc)
+        SqliteFromSyntax (sqliteTableSourceCTEs tableSrc) (sqliteTableSourceRecursive tableSrc)
                          (fromSqliteTableSource tableSrc <> emit " AS " <> quotedIdentifier nm)
   fromTable _ (Just (_, Just _)) = error "beam-sqlite cannot support table names with column aliases"
 
@@ -697,10 +741,10 @@ instance IsSql92FromSyntax SqliteFromSyntax where
 
 _join :: ByteString -> SqliteFromSyntax -> SqliteFromSyntax -> Maybe SqliteExpressionSyntax -> SqliteFromSyntax
 _join joinType a b Nothing =
-  SqliteFromSyntax (sqliteFromCTEs a <> sqliteFromCTEs b)
+  SqliteFromSyntax (sqliteFromCTEs a <> sqliteFromCTEs b) (sqliteFromRecursive a || sqliteFromRecursive b)
                    (fromSqliteFromSyntax a <> spaces (emit joinType) <> fromSqliteFromSyntax b)
 _join joinType a b (Just on) =
-  SqliteFromSyntax (sqliteFromCTEs a <> sqliteFromCTEs b)
+  SqliteFromSyntax (sqliteFromCTEs a <> sqliteFromCTEs b) (sqliteFromRecursive a || sqliteFromRecursive b)
                    (fromSqliteFromSyntax a <> spaces (emit joinType) <> fromSqliteFromSyntax b <> emit " ON " <> fromSqliteExpression on)
 
 instance IsSql92ProjectionSyntax SqliteProjectionSyntax where
@@ -724,12 +768,12 @@ instance IsSql92TableSourceSyntax SqliteTableSourceSyntax where
   type Sql92TableSourceSelectSyntax SqliteTableSourceSyntax = SqliteSelectSyntax
   type Sql92TableSourceExpressionSyntax SqliteTableSourceSyntax = SqliteExpressionSyntax
 
-  tableNamed = SqliteTableSourceSyntax [] . fromSqliteTableName
+  tableNamed = SqliteTableSourceSyntax [] False . fromSqliteTableName
   tableFromSubSelect s =
-    SqliteTableSourceSyntax [] (parens (fromSqliteSelect s))
-  tableFromValues colCount vss = SqliteTableSourceSyntax [SqliteCTE (Just (take colCount beamSqlDefaultColumnNames)) valuesTable] tableRef
+    SqliteTableSourceSyntax (sqliteSelectCTEs s) (sqliteSelectRecursive s) (parens (sqliteBaseSelect s))
+  tableFromValues colCount vss = SqliteTableSourceSyntax [SqliteCTE (Just (take colCount beamSqlDefaultColumnNames)) Nothing valuesTable] False tableRef
     where
-      valuesTable = SqliteSelectSyntax $
+      valuesTable = SqliteSelectSyntax [] False $
                       emit "VALUES " <>
                       commas (map (\vs -> parens (commas (map fromSqliteExpression vs))) vss)
 
@@ -827,8 +871,8 @@ instance IsSql92ExpressionSyntax SqliteExpressionSyntax where
   isFalseE = postFix "IS 0"; isNotFalseE = postFix "IS NOT 0"
   isUnknownE = postFix "IS NULL"; isNotUnknownE = postFix "IS NOT NULL"
 
-  existsE select = SqliteExpressionSyntax (emit "EXISTS " <> parens (fromSqliteSelect select))
-  uniqueE select = SqliteExpressionSyntax (emit "UNIQUE " <> parens (fromSqliteSelect select))
+  existsE select = SqliteExpressionSyntax (emit "EXISTS " <> parens (sqliteBaseSelect select))
+  uniqueE select = SqliteExpressionSyntax (emit "UNIQUE " <> parens (sqliteBaseSelect select))
 
   betweenE a b c = SqliteExpressionSyntax (parens (fromSqliteExpression a) <>
                                            emit " BETWEEN " <>
@@ -841,7 +885,7 @@ instance IsSql92ExpressionSyntax SqliteExpressionSyntax where
   rowE vs = SqliteExpressionSyntax (parens (commas (map fromSqliteExpression vs)))
   fieldE = SqliteExpressionSyntax . fromSqliteFieldNameSyntax
 
-  subqueryE = SqliteExpressionSyntax . parens . fromSqliteSelect
+  subqueryE = SqliteExpressionSyntax . parens . sqliteBaseSelect
 
   positionE needle haystack =
     SqliteExpressionSyntax $
@@ -870,7 +914,7 @@ instance IsSql92ExpressionSyntax SqliteExpressionSyntax where
   defaultE = SqliteExpressionDefault
   inE e es = SqliteExpressionSyntax (parens (fromSqliteExpression e) <> emit " IN " <> parens (commas (map fromSqliteExpression es)))
   inSelectE e sel =
-      SqliteExpressionSyntax (parens (fromSqliteExpression e) <> emit " IN " <> parens (fromSqliteSelect sel))
+      SqliteExpressionSyntax (parens (fromSqliteExpression e) <> emit " IN " <> parens (sqliteBaseSelect sel))
 
 instance IsSql99ConcatExpressionSyntax SqliteExpressionSyntax where
   concatE [] = valueE (sqlValueSyntax ("" :: T.Text))
